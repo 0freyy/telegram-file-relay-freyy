@@ -1,0 +1,33 @@
+name: Telegram File Relay
+on:
+  repository_dispatch:
+    types: [telegram_file]
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests python-telegram-bot
+      
+      - name: Download and relay file
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          FILE_ID: ${{ github.event.client_payload.file_id }}
+        run: python main.py
+      
+      - name: Cleanup temp files
+        if: always()
+        run: rm -f /tmp/telegram_file_* 2>/dev/null || true
