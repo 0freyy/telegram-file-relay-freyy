@@ -15,70 +15,76 @@ TEMP_DIR = Path("/tmp")
 TELEGRAM_API = "https://api.telegram.org"
 
 
-def send_message(chat_id: str, text: str) -> bool:
+def send_message(chat_id: str, text: str):
     try:
-        response = requests.post(
+        requests.post(
             f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": text},
             timeout=10
         )
-        return response.status_code == 200
     except Exception as e:
-        print(f"❌ send_message error: {e}", file=sys.stderr)
-        return False
+        print(f"send_message error: {e}", file=sys.stderr)
 
 
-def get_file_info(file_id: str) -> Optional[dict]:
+# STEP 1 — Get file_path from Telegram (lightweight metadata only)
+def get_file_path(file_id: str) -> Optional[str]:
     try:
-        response = requests.get(
+        r = requests.get(
             f"{TELEGRAM_API}/bot{BOT_TOKEN}/getFile",
             params={"file_id": file_id},
             timeout=10
         )
 
-        data = response.json()
+        data = r.json()
 
-        if data.get("ok"):
-            return data.get("result")
-
-        print(f"❌ Telegram error: {data}", file=sys.stderr)
-        return None
-
-    except Exception as e:
-        print(f"❌ get_file_info error: {e}", file=sys.stderr)
-        return None
-
-
-def download_file(file_path: str, file_id: str) -> Optional[Path]:
-    try:
-        url = f"{TELEGRAM_API}/file/bot{BOT_TOKEN}/{file_path}"
-        response = requests.get(url, timeout=60)
-
-        if response.status_code != 200:
+        if not data.get("ok"):
+            print(f"Telegram error: {data}", file=sys.stderr)
             return None
 
-        temp_file = TEMP_DIR / f"telegram_{file_id[:8]}"
-        temp_file.write_bytes(response.content)
-
-        print(f"✅ downloaded: {temp_file}")
-        return temp_file
+        return data["result"]["file_path"]
 
     except Exception as e:
-        print(f"❌ download error: {e}", file=sys.stderr)
+        print(f"get_file_path error: {e}", file=sys.stderr)
         return None
 
 
-def upload_to_0x0(file_path: Path) -> Optional[str]:
+# STEP 2 — STREAM download (IMPORTANT FIX for large files)
+def download_file(file_path: str, file_id: str) -> Optional[Path]:
+    try:
+        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+
+        local_path = TEMP_DIR / f"{file_id}.bin"
+
+        with requests.get(url, stream=True, timeout=300) as r:
+            if r.status_code != 200:
+                return None
+
+            with open(local_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+        return local_path
+
+    except Exception as e:
+        print(f"download error: {e}", file=sys.stderr)
+        return None
+
+
+# STEP 3 — upload (kept simple, stable priority chain)
+def upload_file(file_path: Path) -> Optional[str]:
     try:
         with open(file_path, "rb") as f:
-            r = requests.post("https://0x0.st", files={"file": f}, timeout=UPLOAD_TIMEOUT)
-        return r.text.strip() if r.status_code == 200 else None
-    except Exception as e:
-        print(f"0x0 failed: {e}", file=sys.stderr)
-        return None
+            r = requests.post(
+                "https://0x0.st",
+                files={"file": f},
+                timeout=UPLOAD_TIMEOUT
+            )
+        if r.status_code == 200:
+            return r.text.strip()
+    except:
+        pass
 
-
-def upload_to_transfer(file_path: Path) -> Optional[str]:
     try:
         with open(file_path, "rb") as f:
             r = requests.post(
@@ -86,59 +92,36 @@ def upload_to_transfer(file_path: Path) -> Optional[str]:
                 files={"file": f},
                 timeout=UPLOAD_TIMEOUT
             )
-        return r.text.strip() if r.status_code == 200 else None
-    except Exception as e:
-        print(f"transfer failed: {e}", file=sys.stderr)
-        return None
+        if r.status_code == 200:
+            return r.text.strip()
+    except:
+        pass
 
-
-def upload_to_gofile(file_path: Path) -> Optional[str]:
     try:
         r = requests.get("https://api.gofile.io/servers", timeout=10)
-        server = r.json().get("data", {}).get("servers", [{}])[0].get("name")
-
-        if not server:
-            return None
+        server = r.json()["data"]["servers"][0]["name"]
 
         with open(file_path, "rb") as f:
-            r = requests.post(
+            r2 = requests.post(
                 f"https://{server}.gofile.io/uploadFile",
                 files={"file": f},
                 timeout=UPLOAD_TIMEOUT
             )
 
-        data = r.json()
+        data = r2.json()
 
         if data.get("status") == "ok":
-            file_id = data.get("data", {}).get("fileId")
-            if file_id:
-                return f"https://gofile.io/d/{file_id}"
-
-        return None
+            return f"https://gofile.io/d/{data['data']['fileId']}"
 
     except Exception as e:
-        print(f"gofile failed: {e}", file=sys.stderr)
-        return None
-
-
-def upload_file(file_path: Path) -> Optional[str]:
-    services = [
-        upload_to_0x0,
-        upload_to_transfer,
-        upload_to_gofile
-    ]
-
-    for service in services:
-        url = service(file_path)
-        if url:
-            return url
+        print(f"gofile error: {e}", file=sys.stderr)
 
     return None
 
 
-def cleanup(file_path: Path):
+def cleanup(path: Path):
     try:
-        file_path.unlink()
+        path.unlink()
     except:
         pass
 
@@ -148,30 +131,28 @@ def main():
         print("Missing env vars", file=sys.stderr)
         sys.exit(1)
 
-    send_message(CHAT_ID, "Downloading...")
+    send_message(CHAT_ID, "📥 Starting download...")
 
-    file_info = get_file_info(FILE_ID)
-    if not file_info:
-        send_message(CHAT_ID, "Failed to get file info")
+    file_path = get_file_path(FILE_ID)
+    if not file_path:
+        send_message(CHAT_ID, "❌ Failed to get file info")
         sys.exit(1)
 
-    file_path = file_info["file_path"]
-
-    temp_file = download_file(file_path, FILE_ID)
-    if not temp_file:
-        send_message(CHAT_ID, "Download failed")
+    local_file = download_file(file_path, FILE_ID)
+    if not local_file:
+        send_message(CHAT_ID, "❌ Download failed")
         sys.exit(1)
 
-    send_message(CHAT_ID, "Uploading...")
+    send_message(CHAT_ID, "📤 Uploading...")
 
-    url = upload_file(temp_file)
+    url = upload_file(local_file)
 
     if url:
-        send_message(CHAT_ID, f"Done:\n{url}")
+        send_message(CHAT_ID, f"✅ Done:\n{url}")
     else:
-        send_message(CHAT_ID, "Upload failed")
+        send_message(CHAT_ID, "❌ Upload failed")
 
-    cleanup(temp_file)
+    cleanup(local_file)
 
 
 if __name__ == "__main__":
